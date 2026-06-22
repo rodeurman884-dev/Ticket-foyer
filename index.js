@@ -278,7 +278,7 @@ client.once('ready', async () => {
   client.user.setPresence({
     status: 'online',
     activities: [{
-      name:  'gg.lefoyer',
+      name:  'gg.Foyer',
       type:  ActivityType.Streaming,
       url:   'https://www.twitch.tv/gg_Foyer'   // URL Twitch obligatoire pour le badge streaming
     }]
