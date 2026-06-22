@@ -3,8 +3,8 @@
 //  • Statut Twitch streaming  /gg.lefoyer
 //  • Keep-alive HTTP + ping externe Render + reconnexion automatique
 //  • /panel removebutton → appuyer sur le bouton à supprimer
-//  • Rôle ping par bouton (configurable)
-//  • Claim/Unclaim verrouillé — édition en direct de l'embed (style Crow Bot)
+//  • Rôle ping par bouton (configurable) + Catégorie par bouton (ID)
+//  • Claim/Unclaim verrouillé — édition en direct de l'embed
 //  • Salons tickets nommés gs-0001, gs-0002, ...
 //  • /add /remove /close (compte à rebours) /delete
 //  • $ownerbot / /ownerbot
@@ -44,17 +44,17 @@ function loadConfig() {
     const def = {
       owners: ['685679698054742017', '1265013712817885297'],
       superiorRoleId:      null,
-      ticketCategoryId:    null,
+      ticketCategoryId:    null,   // catégorie globale par défaut (fallback)
       ticketLogChannelId:  null,
       serverName:          'Le Foyer',
       panelTitle:          'Contacter le Support Le Foyer',
       panelDescription:    'Notre équipe est disponible 24H/24 pour répondre à vos questions et vous accompagner tout au long de votre expérience sur Shibuya!\nVeuillez sélectionner le bouton qui correspond le mieux à votre besoin.',
       panelColor:          0x8B00FF,
-      // Chaque bouton a son propre pingRoleId
+      // Chaque bouton a son propre pingRoleId ET sa propre catégorie (categoryId)
       buttons: [
-        { id: 'ticket_general',  label: 'Support Général', emoji: '🎫', style: 'Primary',   pingRoleId: null },
-        { id: 'ticket_report',   label: 'Signalement',     emoji: '⚠️', style: 'Danger',    pingRoleId: null },
-        { id: 'ticket_question', label: 'Question',        emoji: '❓', style: 'Secondary', pingRoleId: null }
+        { id: 'ticket_general',  label: 'Support Général', emoji: '🎫', style: 'Primary',   pingRoleId: null, categoryId: null },
+        { id: 'ticket_report',   label: 'Signalement',     emoji: '⚠️', style: 'Danger',    pingRoleId: null, categoryId: null },
+        { id: 'ticket_question', label: 'Question',        emoji: '❓', style: 'Secondary', pingRoleId: null, categoryId: null }
       ],
       ticketCount: 0,
       // mode temporaire : si non-null, l'owner qui a lancé /panel removebutton attend un clic
@@ -112,6 +112,10 @@ client.on('error', (err) => {
 // ══════════════════════════════════════════════════════════
 function isOwner(userId) {
   return loadConfig().owners.includes(String(userId));
+}
+
+function isValidId(id) {
+  return /^\d{17,20}$/.test(id || '');
 }
 
 const STYLE_MAP = {
@@ -209,7 +213,7 @@ const commands = [
       .addRoleOption(o => o.setName('role').setDescription('Rôle supérieur').setRequired(true)))
     .addSubcommand(s => s
       .setName('category')
-      .setDescription('Catégorie où créer les tickets')
+      .setDescription('Catégorie par défaut où créer les tickets (si un bouton n\'a pas la sienne)')
       .addChannelOption(o => o.setName('categorie').setDescription('Catégorie').setRequired(true)))
     .addSubcommand(s => s
       .setName('logchannel')
@@ -238,6 +242,7 @@ const commands = [
       .addStringOption(o => o.setName('id').setDescription('ID unique, ex: ticket_vip').setRequired(true))
       .addStringOption(o => o.setName('label').setDescription('Texte du bouton').setRequired(true))
       .addRoleOption(o => o.setName('pingrole').setDescription('Rôle pingé pour ce bouton').setRequired(true))
+      .addStringOption(o => o.setName('categorie').setDescription('ID de la catégorie où ouvrir les tickets de ce bouton (optionnel)').setRequired(false))
       .addStringOption(o => o.setName('emoji').setDescription('Emoji').setRequired(false))
       .addStringOption(o => o.setName('style').setDescription('Primary/Secondary/Success/Danger').setRequired(false)))
     .addSubcommand(s => s
@@ -249,8 +254,13 @@ const commands = [
       .addStringOption(o => o.setName('id').setDescription('ID du bouton').setRequired(true))
       .addRoleOption(o => o.setName('role').setDescription('Nouveau rôle pingé').setRequired(true)))
     .addSubcommand(s => s
+      .setName('setcategory')
+      .setDescription('Modifie la catégorie d\'un bouton existant')
+      .addStringOption(o => o.setName('id').setDescription('ID du bouton').setRequired(true))
+      .addStringOption(o => o.setName('categorie').setDescription('ID de la catégorie').setRequired(true)))
+    .addSubcommand(s => s
       .setName('listbuttons')
-      .setDescription('Liste tous les boutons avec leurs rôles')),
+      .setDescription('Liste tous les boutons avec leurs rôles et catégories')),
 
   // ── /add ────────────────────────────────────────────────
   new SlashCommandBuilder()
@@ -330,7 +340,7 @@ client.on('messageCreate', async (message) => {
     const mention  = message.mentions.users.first();
     const targetId = mention ? mention.id : args[0];
 
-    if (!targetId || !/^\d{17,19}$/.test(targetId))
+    if (!targetId || !isValidId(targetId))
       return message.reply('❌ Mentionne un utilisateur ou donne un ID valide.');
 
     const cfg = loadConfig();
@@ -399,7 +409,7 @@ client.on('interactionCreate', async (interaction) => {
       if (sub === 'category') {
         cfg.ticketCategoryId = interaction.options.getChannel('categorie').id;
         saveConfig(cfg);
-        return interaction.reply({ content: `✅ Catégorie définie.`, ephemeral: true });
+        return interaction.reply({ content: `✅ Catégorie par défaut définie.`, ephemeral: true });
       }
 
       if (sub === 'logchannel') {
@@ -439,16 +449,20 @@ client.on('interactionCreate', async (interaction) => {
         const id       = interaction.options.getString('id');
         const label    = interaction.options.getString('label');
         const role     = interaction.options.getRole('pingrole');
+        const categorie = interaction.options.getString('categorie');
         const emoji    = interaction.options.getString('emoji')  ?? '🎫';
         const style    = interaction.options.getString('style')  ?? 'Primary';
 
         if (cfg.buttons.find(b => b.id === id))
           return interaction.reply({ content: `❌ Un bouton avec l'ID \`${id}\` existe déjà.`, ephemeral: true });
 
-        cfg.buttons.push({ id, label, emoji, style, pingRoleId: role.id });
+        if (categorie && !isValidId(categorie))
+          return interaction.reply({ content: '❌ L\'ID de catégorie fourni n\'est pas valide.', ephemeral: true });
+
+        cfg.buttons.push({ id, label, emoji, style, pingRoleId: role.id, categoryId: categorie || null });
         saveConfig(cfg);
         return interaction.reply({
-          content: `✅ Bouton **${label}** ajouté (ping : <@&${role.id}>).\nPense à renvoyer le panel avec \`/setup panel\`.`,
+          content: `✅ Bouton **${label}** ajouté (ping : <@&${role.id}>${categorie ? `, catégorie : \`${categorie}\`` : ''}).\nPense à renvoyer le panel avec \`/setup panel\`.`,
           ephemeral: true
         });
       }
@@ -463,6 +477,21 @@ client.on('interactionCreate', async (interaction) => {
         btn.pingRoleId = role.id;
         saveConfig(cfg);
         return interaction.reply({ content: `✅ Rôle pingé pour **${btn.label}** → <@&${role.id}>`, ephemeral: true });
+      }
+
+      if (sub === 'setcategory') {
+        const id        = interaction.options.getString('id');
+        const categorie = interaction.options.getString('categorie');
+        const btn       = cfg.buttons.find(b => b.id === id);
+
+        if (!btn)
+          return interaction.reply({ content: `❌ Bouton \`${id}\` introuvable.`, ephemeral: true });
+        if (!isValidId(categorie))
+          return interaction.reply({ content: '❌ L\'ID de catégorie fourni n\'est pas valide.', ephemeral: true });
+
+        btn.categoryId = categorie;
+        saveConfig(cfg);
+        return interaction.reply({ content: `✅ Catégorie pour **${btn.label}** → \`${categorie}\``, ephemeral: true });
       }
 
       // ── /panel removebutton ─ affiche les boutons à cliquer ──
@@ -489,7 +518,7 @@ client.on('interactionCreate', async (interaction) => {
           return interaction.reply({ content: 'Aucun bouton configuré.', ephemeral: true });
 
         const list = cfg.buttons.map(b =>
-          `• \`${b.id}\` — ${b.emoji} **${b.label}** | Style: ${b.style} | Ping: ${b.pingRoleId ? `<@&${b.pingRoleId}>` : '*aucun*'}`
+          `• \`${b.id}\` — ${b.emoji} **${b.label}** | Style: ${b.style} | Ping: ${b.pingRoleId ? `<@&${b.pingRoleId}>` : '*aucun*'} | Catégorie: ${b.categoryId ? `\`${b.categoryId}\`` : '*globale*'}`
         ).join('\n');
 
         return interaction.reply({ content: `**Boutons du panel :**\n${list}`, ephemeral: true });
@@ -728,9 +757,11 @@ client.on('interactionCreate', async (interaction) => {
     const ticketNum = String(cfg.ticketCount).padStart(4, '0');
     saveConfig(cfg);
 
-    const guild    = interaction.guild;
-    const btnDef   = cfg.buttons.find(b => b.id === buttonId);
-    const pingRole = btnDef?.pingRoleId ?? null;
+    const guild      = interaction.guild;
+    const btnDef     = cfg.buttons.find(b => b.id === buttonId);
+    const pingRole   = btnDef?.pingRoleId ?? null;
+    // Catégorie du bouton en priorité, sinon catégorie globale par défaut
+    const categoryId = btnDef?.categoryId || cfg.ticketCategoryId || null;
 
     // Permissions du salon privé
     const overwrites = [
@@ -747,32 +778,34 @@ client.on('interactionCreate', async (interaction) => {
       // Le topic stocke le btnId et le créateur pour claim/unclaim
       topic: `btnId:${buttonId}|creator:${interaction.user.id}`
     };
-    if (cfg.ticketCategoryId) channelOpts.parent = cfg.ticketCategoryId;
+    if (categoryId) channelOpts.parent = categoryId;
 
     let ticketChannel;
     try {
       ticketChannel = await guild.channels.create(channelOpts);
     } catch (e) {
       console.error('[Ticket] Création échouée :', e);
-      return interaction.editReply({ content: '❌ Impossible de créer le ticket. Vérifie les permissions du bot.' });
+      return interaction.editReply({ content: '❌ Impossible de créer le ticket. Vérifie les permissions du bot et que la catégorie configurée existe bien.' });
     }
 
-    // ── Embed du ticket (style "Gestion Staff") ──────────
+    // ── Embed du ticket — texte dynamique basé sur le rôle pingé ──
     const ticketEmbed = new EmbedBuilder()
       .setColor(0x8B00FF)
-      .setAuthor({ name: 'Gestion Staff', iconURL: client.user.displayAvatarURL() })
+      .setAuthor({ name: btnDef ? btnDef.label : 'Support', iconURL: client.user.displayAvatarURL() })
       .setDescription(
-        `Un membre de l'équipe de Gestion Staff va vous répondre très rapidement.\n\nPour fermer le ticket, utilisez la commande \`/delete\``
+        pingRole
+          ? `Un <@&${pingRole}> va vous répondre très rapidement.\n\nPour fermer le ticket, utilisez la commande \`/delete\``
+          : `Un membre du staff va vous répondre très rapidement.\n\nPour fermer le ticket, utilisez la commande \`/delete\``
       )
       .addFields({ name: 'Raison', value: reason })
       .setThumbnail(interaction.user.displayAvatarURL({ dynamic: true }))
       .setFooter({ text: interaction.user.username })
       .setTimestamp();
 
-    // Claim désactivé au départ tant que personne n'a claim, Unclaim désactivé tant que pas claim
+    // Claim disponible, Unclaim grisé au départ
     const claimRow = buildClaimRow(false);
 
-    // Ping : le créateur + le rôle du bouton
+    // Ping : le créateur + le rôle du bouton (même logique dynamique)
     let pingContent = `<@${interaction.user.id}>\n`;
     pingContent += pingRole
       ? `Un <@&${pingRole}> va te répondre dans les minutes qui suivent !`
