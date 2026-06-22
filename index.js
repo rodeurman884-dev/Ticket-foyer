@@ -1,7 +1,7 @@
 // ════════════════════════════════════════════════════════════════════════════
 //  BOT TICKET — LE FOYER  |  index.js
 //  • Statut Twitch streaming  /gg.lefoyer
-//  • Keep-alive HTTP + reconnexion automatique
+//  • Keep-alive HTTP + ping externe Render + reconnexion automatique
 //  • /panel removebutton → appuyer sur le bouton à supprimer
 //  • Rôle ping par bouton (configurable)
 //  • Claim/Unclaim sécurisé
@@ -19,13 +19,19 @@ const {
   Routes, REST, ActivityType
 } = require('discord.js');
 
-const fs   = require('fs');
-const http = require('http');
+const fs    = require('fs');
+const http  = require('http');
+const https = require('https');
 
 // ══════════════════════════════════════════════════════════
 //  ID DU SERVEUR (Le Foyer)
 // ══════════════════════════════════════════════════════════
 const GUILD_ID = '1516440178871504916';
+
+// ══════════════════════════════════════════════════════════
+//  URL RENDER (pour le keep-alive externe)
+// ══════════════════════════════════════════════════════════
+const RENDER_URL = 'https://ticket-foyer.onrender.com';
 
 // ══════════════════════════════════════════════════════════
 //  CONFIG
@@ -77,7 +83,7 @@ const client = new Client({
 });
 
 // ══════════════════════════════════════════════════════════
-//  KEEP-ALIVE  (HTTP interne + reconnexion Discord auto)
+//  KEEP-ALIVE  (HTTP interne + ping externe Render + reconnexion Discord auto)
 // ══════════════════════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
 
@@ -86,9 +92,11 @@ http.createServer((req, res) => {
   res.end('Bot Le Foyer — alive ✅');
 }).listen(PORT, () => console.log(`[KeepAlive] HTTP sur le port ${PORT}`));
 
-// Self-ping silencieux toutes les 30 secondes (évite le sleep Render)
+// Self-ping EXTERNE toutes les 30 secondes vers l'URL publique Render.
+// (Un ping vers localhost ne suffit pas : Render ne surveille que le
+//  trafic entrant externe pour décider de mettre le service en veille.)
 setInterval(() => {
-  http.get(`http://localhost:${PORT}`, () => {}).on('error', () => {});
+  https.get(RENDER_URL, () => {}).on('error', () => {});
 }, 30_000);
 
 // Auto-reconnexion si le bot se déconnecte
