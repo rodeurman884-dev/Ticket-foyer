@@ -4,7 +4,8 @@
 //  • Keep-alive HTTP + ping externe Render + reconnexion automatique
 //  • /panel removebutton → appuyer sur le bouton à supprimer
 //  • Rôle ping par bouton (configurable)
-//  • Claim/Unclaim sécurisé
+//  • Claim/Unclaim verrouillé — édition en direct de l'embed (style Crow Bot)
+//  • Salons tickets nommés gs-0001, gs-0002, ...
 //  • /add /remove /close (compte à rebours) /delete
 //  • $ownerbot / /ownerbot
 // ════════════════════════════════════════════════════════════════════════════
@@ -93,8 +94,6 @@ http.createServer((req, res) => {
 }).listen(PORT, () => console.log(`[KeepAlive] HTTP sur le port ${PORT}`));
 
 // Self-ping EXTERNE toutes les 30 secondes vers l'URL publique Render.
-// (Un ping vers localhost ne suffit pas : Render ne surveille que le
-//  trafic entrant externe pour décider de mettre le service en veille.)
 setInterval(() => {
   https.get(RENDER_URL, () => {}).on('error', () => {});
 }, 30_000);
@@ -172,6 +171,24 @@ function buildRemoveRows(cfg) {
     );
   }
   return rows;
+}
+
+/** Construit la rangée Claim/Unclaim en fonction de l'état de claim */
+function buildClaimRow(claimed) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('ticket_claim')
+      .setLabel('Claim')
+      .setEmoji('✅')
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(claimed),     // grisé si déjà claim
+    new ButtonBuilder()
+      .setCustomId('ticket_unclaim')
+      .setLabel('Unclaim')
+      .setEmoji('❌')
+      .setStyle(ButtonStyle.Danger)
+      .setDisabled(!claimed)     // grisé si pas encore claim
+  );
 }
 
 // ══════════════════════════════════════════════════════════
@@ -280,7 +297,7 @@ client.once('ready', async () => {
     activities: [{
       name:  'gg.lefoyer',
       type:  ActivityType.Streaming,
-      url:   'https://www.twitch.tv/gg_Foyer'   // URL Twitch obligatoire pour le badge streaming
+      url:   'https://www.twitch.tv/gg_lefoyer'   // URL Twitch obligatoire pour le badge streaming
     }]
   });
 
@@ -481,7 +498,7 @@ client.on('interactionCreate', async (interaction) => {
 
     // ── /add ─────────────────────────────────────────────
     if (commandName === 'add') {
-      if (!interaction.channel.name?.startsWith('ticket-'))
+      if (!interaction.channel.name?.startsWith('gs-'))
         return interaction.reply({ content: '❌ Utilisable uniquement dans un ticket.', ephemeral: true });
 
       const user     = interaction.options.getUser('user');
@@ -503,7 +520,7 @@ client.on('interactionCreate', async (interaction) => {
 
     // ── /remove ──────────────────────────────────────────
     if (commandName === 'remove') {
-      if (!interaction.channel.name?.startsWith('ticket-'))
+      if (!interaction.channel.name?.startsWith('gs-'))
         return interaction.reply({ content: '❌ Utilisable uniquement dans un ticket.', ephemeral: true });
 
       const user     = interaction.options.getUser('user');
@@ -523,7 +540,7 @@ client.on('interactionCreate', async (interaction) => {
 
     // ── /close ───────────────────────────────────────────
     if (commandName === 'close') {
-      if (!interaction.channel.name?.startsWith('ticket-'))
+      if (!interaction.channel.name?.startsWith('gs-'))
         return interaction.reply({ content: '❌ Utilisable uniquement dans un ticket.', ephemeral: true });
 
       const buildCloseEmbed = (n) => new EmbedBuilder()
@@ -552,7 +569,7 @@ client.on('interactionCreate', async (interaction) => {
 
     // ── /delete ──────────────────────────────────────────
     if (commandName === 'delete') {
-      if (!interaction.channel.name?.startsWith('ticket-'))
+      if (!interaction.channel.name?.startsWith('gs-'))
         return interaction.reply({ content: '❌ Utilisable uniquement dans un ticket.', ephemeral: true });
 
       await interaction.reply({ content: '🗑️ Suppression du ticket...' });
@@ -594,16 +611,25 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     // ── Claim ────────────────────────────────────────────
-    if (customId.startsWith('claim_')) {
+    if (customId === 'ticket_claim') {
+      const topic = interaction.channel.topic || '';
+
+      // Déjà claim ? → on bloque, il faut passer par Unclaim
+      const claimedMatch = topic.match(/claimed:(\d+)/);
+      if (claimedMatch) {
+        return interaction.reply({
+          content: `❌ Ce ticket est déjà claim par <@${claimedMatch[1]}>. Utilise **Unclaim** pour le libérer.`,
+          ephemeral: true
+        });
+      }
+
       const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
       if (!member) return interaction.reply({ content: '❌ Erreur membre.', ephemeral: true });
 
-      // Récupérer le pingRoleId lié à ce ticket via le topic
-      const topic     = interaction.channel.topic || '';
-      const btnIdMatch = topic.match(/btnId:([^|]+)/);
+      const btnIdMatch  = topic.match(/btnId:([^|]+)/);
       const ticketBtnId = btnIdMatch ? btnIdMatch[1] : null;
-      const btnDef    = ticketBtnId ? cfg.buttons.find(b => b.id === ticketBtnId) : null;
-      const pingRoleId = btnDef?.pingRoleId ?? null;
+      const btnDef      = ticketBtnId ? cfg.buttons.find(b => b.id === ticketBtnId) : null;
+      const pingRoleId  = btnDef?.pingRoleId ?? null;
 
       const canAct =
         (pingRoleId           && member.roles.cache.has(pingRoleId))       ||
@@ -617,66 +643,52 @@ client.on('interactionCreate', async (interaction) => {
         });
 
       await interaction.channel.setTopic(
-        topic.replace(/claimed:[^|]*/g, '').trim() + `|claimed:${interaction.user.id}`
+        topic.replace(/\|?claimed:\d+/g, '').trim() + `|claimed:${interaction.user.id}`
       ).catch(() => {});
 
-      return interaction.reply({
-        embeds: [
-          new EmbedBuilder()
-            .setColor(0x00CC66)
-            .setDescription(`✅ Ticket **claim** par <@${interaction.user.id}>`)
-            .setFooter({ text: cfg.serverName })
-        ]
-      });
+      // On édite l'embed existant pour ajouter "Claimed by"
+      const embed = EmbedBuilder.from(interaction.message.embeds[0])
+        .addFields({
+          name:  'Claimed by',
+          value: `<@${interaction.user.id}>\n(${interaction.user.username})`
+        });
+
+      return interaction.update({ embeds: [embed], components: [buildClaimRow(true)] });
     }
 
     // ── Unclaim ──────────────────────────────────────────
-    if (customId.startsWith('unclaim_')) {
+    if (customId === 'ticket_unclaim') {
+      const topic = interaction.channel.topic || '';
+      const claimedMatch = topic.match(/claimed:(\d+)/);
+
+      if (!claimedMatch)
+        return interaction.reply({ content: '❌ Ce ticket n\'est pas claim.', ephemeral: true });
+
+      const claimedBy = claimedMatch[1];
+
       const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
       if (!member) return interaction.reply({ content: '❌ Erreur membre.', ephemeral: true });
 
-      const topic      = interaction.channel.topic || '';
-      const claimedMatch = topic.match(/claimed:(\d+)/);
-      const claimedBy  = claimedMatch ? claimedMatch[1] : null;
+      const canManage =
+        claimedBy === interaction.user.id ||
+        isOwner(interaction.user.id) ||
+        (cfg.superiorRoleId && member.roles.cache.has(cfg.superiorRoleId));
 
-      const btnIdMatch  = topic.match(/btnId:([^|]+)/);
-      const ticketBtnId = btnIdMatch ? btnIdMatch[1] : null;
-      const btnDef     = ticketBtnId ? cfg.buttons.find(b => b.id === ticketBtnId) : null;
-      const pingRoleId  = btnDef?.pingRoleId ?? null;
-
-      const canAct =
-        (pingRoleId           && member.roles.cache.has(pingRoleId))       ||
-        (cfg.superiorRoleId   && member.roles.cache.has(cfg.superiorRoleId)) ||
-        isOwner(interaction.user.id);
-
-      if (!canAct)
-        return interaction.reply({
-          content: '❌ Vous ne pouvez pas unclaim ce ticket car vous n\'avez pas les permissions.',
-          ephemeral: true
-        });
-
-      if (claimedBy &&
-          claimedBy !== interaction.user.id &&
-          !isOwner(interaction.user.id) &&
-          !(cfg.superiorRoleId && member.roles.cache.has(cfg.superiorRoleId))) {
+      if (!canManage)
         return interaction.reply({
           content: '❌ Vous ne pouvez pas unclaim ce ticket car vous n\'en êtes pas le propriétaire.',
           ephemeral: true
         });
-      }
 
       await interaction.channel.setTopic(
         topic.replace(/\|?claimed:\d+/g, '').trim()
       ).catch(() => {});
 
-      return interaction.reply({
-        embeds: [
-          new EmbedBuilder()
-            .setColor(0xFF4444)
-            .setDescription(`🔓 Ticket **unclaim** par <@${interaction.user.id}>`)
-            .setFooter({ text: cfg.serverName })
-        ]
-      });
+      // On édite l'embed existant pour retirer "Claimed by"
+      const embed = EmbedBuilder.from(interaction.message.embeds[0]);
+      embed.data.fields = (embed.data.fields || []).filter(f => f.name !== 'Claimed by');
+
+      return interaction.update({ embeds: [embed], components: [buildClaimRow(false)] });
     }
 
     // ── Boutons du panel (ouverture de ticket) ───────────
@@ -729,7 +741,7 @@ client.on('interactionCreate', async (interaction) => {
     if (cfg.superiorRoleId) overwrites.push({ id: cfg.superiorRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
 
     const channelOpts = {
-      name:               `ticket-${ticketNum}`,
+      name:               `gs-${ticketNum}`,
       type:               ChannelType.GuildText,
       permissionOverwrites: overwrites,
       // Le topic stocke le btnId et le créateur pour claim/unclaim
@@ -745,27 +757,26 @@ client.on('interactionCreate', async (interaction) => {
       return interaction.editReply({ content: '❌ Impossible de créer le ticket. Vérifie les permissions du bot.' });
     }
 
-    // Embed du ticket (rebord violet)
+    // ── Embed du ticket (style "Gestion Staff") ──────────
     const ticketEmbed = new EmbedBuilder()
       .setColor(0x8B00FF)
-      .setTitle(`🎫 Ticket Créé #${ticketNum}`)
-      .addFields(
-        { name: '👤 Créé par',   value: `<@${interaction.user.id}>`,          inline: true  },
-        { name: '📋 Catégorie',  value: btnDef ? btnDef.label : buttonId,     inline: true  },
-        { name: '📝 Raison',     value: reason                                               }
+      .setAuthor({ name: 'Gestion Staff', iconURL: client.user.displayAvatarURL() })
+      .setDescription(
+        `Un membre de l'équipe de Gestion Staff va vous répondre très rapidement.\n\nPour fermer le ticket, utilisez la commande \`/delete\``
       )
+      .addFields({ name: 'Raison', value: reason })
       .setThumbnail(interaction.user.displayAvatarURL({ dynamic: true }))
-      .setFooter({ text: cfg.serverName })
+      .setFooter({ text: interaction.user.username })
       .setTimestamp();
 
-    const claimRow = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(`claim_${interaction.user.id}`).setLabel('Claim').setEmoji('✅').setStyle(ButtonStyle.Success),
-      new ButtonBuilder().setCustomId(`unclaim_${interaction.user.id}`).setLabel('Unclaim').setEmoji('❌').setStyle(ButtonStyle.Danger)
-    );
+    // Claim désactivé au départ tant que personne n'a claim, Unclaim désactivé tant que pas claim
+    const claimRow = buildClaimRow(false);
 
     // Ping : le créateur + le rôle du bouton
-    let pingContent = `<@${interaction.user.id}>`;
-    if (pingRole) pingContent += ` <@&${pingRole}>`;
+    let pingContent = `<@${interaction.user.id}>\n`;
+    pingContent += pingRole
+      ? `Un <@&${pingRole}> va te répondre dans les minutes qui suivent !`
+      : `Un membre du staff va te répondre dans les minutes qui suivent !`;
 
     await ticketChannel.send({ content: pingContent, embeds: [ticketEmbed], components: [claimRow] });
 
