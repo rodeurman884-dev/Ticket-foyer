@@ -280,7 +280,7 @@ client.once('ready', async () => {
     activities: [{
       name:  'gg.lefoyer',
       type:  ActivityType.Streaming,
-      url:   'https://www.twitch.tv/gg_lefoyer'   // URL Twitch obligatoire pour le badge streaming
+      url:   'https://www.twitch.tv/gg_Foyer'   // URL Twitch obligatoire pour le badge streaming
     }]
   });
 
