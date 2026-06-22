@@ -1,4 +1,4 @@
-// ════════════════════════════════════════════════════════════════════════════
+ // ════════════════════════════════════════════════════════════════════════════
 //  BOT TICKET — LE FOYER  |  index.js
 //  • Statut Twitch streaming  /gg.lefoyer
 //  • Keep-alive HTTP + ping externe Render + reconnexion automatique
