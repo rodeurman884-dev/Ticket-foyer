@@ -4,9 +4,14 @@
 //  • Keep-alive HTTP + ping externe Render + reconnexion automatique
 //  • /panel removebutton → appuyer sur le bouton à supprimer
 //  • Rôle ping par bouton (configurable) + Catégorie par bouton (ID)
-//  • Claim/Unclaim verrouillé — édition en direct de l'embed
+//  • Claim/Unclaim verrouillé — état stocké dans un registre interne (config.json),
+//    plus aucune écriture répétée dans le topic du salon (fix bug "Échec de
+//    l'interaction" causé par le rate-limit Discord sur les modifs de salon)
 //  • Salons tickets nommés gs-0001, gs-0002, ...
+//  • /rename <message> → renomme le salon ticket courant
 //  • /add /remove /close (compte à rebours) /delete
+//  • Rôles autorisés à utiliser /add /remove /close /delete /rename, configurables
+//    via /setup addmanagerole, removemanagerole, listmanageroles
 //  • $ownerbot / /ownerbot
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -58,7 +63,14 @@ function loadConfig() {
       ],
       ticketCount: 0,
       // mode temporaire : si non-null, l'owner qui a lancé /panel removebutton attend un clic
-      pendingRemove: null
+      pendingRemove: null,
+      // Rôles (en plus des owners et du rôle supérieur) autorisés à utiliser
+      // /add /remove /close /delete /rename
+      manageRoles: [],
+      // Registre interne des tickets : { [channelId]: { btnId, creatorId, claimedBy } }
+      // Remplace le stockage dans le topic du salon (qui causait des échecs
+      // d'interaction à cause du rate-limit Discord sur les modifs de salon).
+      tickets: {}
     };
     fs.writeFileSync(CONFIG_FILE, JSON.stringify(def, null, 2));
     return def;
@@ -195,6 +207,68 @@ function buildClaimRow(claimed) {
   );
 }
 
+/**
+ * Récupère les infos d'un ticket à partir du salon, en les lisant dans le
+ * registre interne (cfg.tickets). Si le salon est un ancien ticket créé avant
+ * la mise à jour (infos encore dans le topic), on le migre automatiquement
+ * vers le registre au passage.
+ * Retourne null si le salon n'est pas un ticket.
+ */
+function getTicket(cfg, channel) {
+  if (!cfg.tickets) cfg.tickets = {};
+  if (cfg.tickets[channel.id]) return cfg.tickets[channel.id];
+
+  // Rétrocompatibilité avec l'ancien système basé sur le topic du salon
+  if (channel.name?.startsWith('gs-')) {
+    const topic = channel.topic || '';
+    const btnMatch     = topic.match(/btnId:([^|]+)/);
+    const creatorMatch = topic.match(/creator:(\d+)/);
+    const claimedMatch = topic.match(/claimed:(\d+)/);
+
+    const ticket = {
+      btnId:     btnMatch ? btnMatch[1] : null,
+      creatorId: creatorMatch ? creatorMatch[1] : null,
+      claimedBy: claimedMatch ? claimedMatch[1] : null
+    };
+    cfg.tickets[channel.id] = ticket;
+    saveConfig(cfg);
+    return ticket;
+  }
+
+  return null;
+}
+
+/**
+ * Vérifie si un membre est autorisé à utiliser /add /remove /close /delete /rename
+ * sur ce ticket : owner du bot, rôle supérieur, un rôle de cfg.manageRoles,
+ * ou le rôle pingé assigné au bouton ayant créé ce ticket.
+ */
+function canManageTicket(cfg, member, ticket) {
+  if (!member) return false;
+  if (isOwner(member.id)) return true;
+  if (cfg.superiorRoleId && member.roles.cache.has(cfg.superiorRoleId)) return true;
+  if (Array.isArray(cfg.manageRoles) && cfg.manageRoles.some(r => member.roles.cache.has(r))) return true;
+
+  if (ticket?.btnId) {
+    const btnDef = cfg.buttons.find(b => b.id === ticket.btnId);
+    if (btnDef?.pingRoleId && member.roles.cache.has(btnDef.pingRoleId)) return true;
+  }
+  return false;
+}
+
+/** Nettoie une chaîne pour en faire un nom de salon Discord valide */
+function sanitizeChannelName(raw) {
+  const s = (raw || '')
+    .toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // retire les accents
+    .trim()
+    .replace(/\s+/g, '-')
+    .replace(/[^a-z0-9\-_]/g, '')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return s.slice(0, 100);
+}
+
 // ══════════════════════════════════════════════════════════
 //  SLASH COMMANDS DEFINITIONS
 // ══════════════════════════════════════════════════════════
@@ -218,7 +292,18 @@ const commands = [
     .addSubcommand(s => s
       .setName('logchannel')
       .setDescription('Salon de logs des tickets')
-      .addChannelOption(o => o.setName('salon').setDescription('Salon logs').setRequired(true))),
+      .addChannelOption(o => o.setName('salon').setDescription('Salon logs').setRequired(true)))
+    .addSubcommand(s => s
+      .setName('addmanagerole')
+      .setDescription('Autorise un rôle à utiliser /add /remove /close /delete /rename')
+      .addRoleOption(o => o.setName('role').setDescription('Rôle à autoriser').setRequired(true)))
+    .addSubcommand(s => s
+      .setName('removemanagerole')
+      .setDescription('Retire un rôle de la liste des rôles autorisés')
+      .addRoleOption(o => o.setName('role').setDescription('Rôle à retirer').setRequired(true)))
+    .addSubcommand(s => s
+      .setName('listmanageroles')
+      .setDescription('Liste les rôles autorisés à gérer les tickets')),
 
   // ── /panel ──────────────────────────────────────────────
   new SlashCommandBuilder()
@@ -285,6 +370,12 @@ const commands = [
   new SlashCommandBuilder()
     .setName('delete')
     .setDescription('Supprime immédiatement le ticket'),
+
+  // ── /rename ─────────────────────────────────────────────
+  new SlashCommandBuilder()
+    .setName('rename')
+    .setDescription('Renomme le salon ticket actuel')
+    .addStringOption(o => o.setName('message').setDescription('Nouveau nom du salon').setRequired(true)),
 
   // ── /ownerbot ───────────────────────────────────────────
   new SlashCommandBuilder()
@@ -417,6 +508,32 @@ client.on('interactionCreate', async (interaction) => {
         saveConfig(cfg);
         return interaction.reply({ content: `✅ Salon de logs : <#${cfg.ticketLogChannelId}>`, ephemeral: true });
       }
+
+      if (sub === 'addmanagerole') {
+        const role = interaction.options.getRole('role');
+        if (!Array.isArray(cfg.manageRoles)) cfg.manageRoles = [];
+        if (cfg.manageRoles.includes(role.id))
+          return interaction.reply({ content: '⚠️ Ce rôle est déjà autorisé.', ephemeral: true });
+
+        cfg.manageRoles.push(role.id);
+        saveConfig(cfg);
+        return interaction.reply({ content: `✅ <@&${role.id}> peut maintenant utiliser /add /remove /close /delete /rename.`, ephemeral: true });
+      }
+
+      if (sub === 'removemanagerole') {
+        const role = interaction.options.getRole('role');
+        cfg.manageRoles = (cfg.manageRoles || []).filter(r => r !== role.id);
+        saveConfig(cfg);
+        return interaction.reply({ content: `✅ <@&${role.id}> retiré de la liste des rôles autorisés.`, ephemeral: true });
+      }
+
+      if (sub === 'listmanageroles') {
+        const roles = cfg.manageRoles || [];
+        if (!roles.length)
+          return interaction.reply({ content: 'Aucun rôle configuré (seuls les owners, le rôle supérieur et le rôle pingé de chaque bouton peuvent gérer leurs tickets).', ephemeral: true });
+
+        return interaction.reply({ content: `**Rôles autorisés à gérer les tickets :**\n${roles.map(r => `• <@&${r}>`).join('\n')}`, ephemeral: true });
+      }
     }
 
     // ── /panel ───────────────────────────────────────────
@@ -527,8 +644,13 @@ client.on('interactionCreate', async (interaction) => {
 
     // ── /add ─────────────────────────────────────────────
     if (commandName === 'add') {
-      if (!interaction.channel.name?.startsWith('gs-'))
+      const ticket = getTicket(cfg, interaction.channel);
+      if (!ticket)
         return interaction.reply({ content: '❌ Utilisable uniquement dans un ticket.', ephemeral: true });
+
+      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      if (!canManageTicket(cfg, member, ticket))
+        return interaction.reply({ content: '❌ Vous n\'avez pas la permission d\'utiliser cette commande.', ephemeral: true });
 
       const user     = interaction.options.getUser('user');
       const rawId    = interaction.options.getString('id');
@@ -549,8 +671,13 @@ client.on('interactionCreate', async (interaction) => {
 
     // ── /remove ──────────────────────────────────────────
     if (commandName === 'remove') {
-      if (!interaction.channel.name?.startsWith('gs-'))
+      const ticket = getTicket(cfg, interaction.channel);
+      if (!ticket)
         return interaction.reply({ content: '❌ Utilisable uniquement dans un ticket.', ephemeral: true });
+
+      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      if (!canManageTicket(cfg, member, ticket))
+        return interaction.reply({ content: '❌ Vous n\'avez pas la permission d\'utiliser cette commande.', ephemeral: true });
 
       const user     = interaction.options.getUser('user');
       const rawId    = interaction.options.getString('id');
@@ -569,8 +696,13 @@ client.on('interactionCreate', async (interaction) => {
 
     // ── /close ───────────────────────────────────────────
     if (commandName === 'close') {
-      if (!interaction.channel.name?.startsWith('gs-'))
+      const ticket = getTicket(cfg, interaction.channel);
+      if (!ticket)
         return interaction.reply({ content: '❌ Utilisable uniquement dans un ticket.', ephemeral: true });
+
+      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      if (!canManageTicket(cfg, member, ticket))
+        return interaction.reply({ content: '❌ Vous n\'avez pas la permission d\'utiliser cette commande.', ephemeral: true });
 
       const buildCloseEmbed = (n) => new EmbedBuilder()
         .setColor(0x8B00FF)
@@ -584,10 +716,17 @@ client.on('interactionCreate', async (interaction) => {
 
       const msg = await interaction.reply({ embeds: [buildCloseEmbed(5)], fetchReply: true });
       let count = 4;
+      const channelId = interaction.channel.id;
 
       const iv = setInterval(async () => {
         if (count <= 0) {
           clearInterval(iv);
+          // On nettoie le registre interne pour éviter qu'il ne s'accumule
+          const freshCfg = loadConfig();
+          if (freshCfg.tickets) {
+            delete freshCfg.tickets[channelId];
+            saveConfig(freshCfg);
+          }
           await interaction.channel.delete().catch(() => {});
           return;
         }
@@ -598,11 +737,51 @@ client.on('interactionCreate', async (interaction) => {
 
     // ── /delete ──────────────────────────────────────────
     if (commandName === 'delete') {
-      if (!interaction.channel.name?.startsWith('gs-'))
+      const ticket = getTicket(cfg, interaction.channel);
+      if (!ticket)
         return interaction.reply({ content: '❌ Utilisable uniquement dans un ticket.', ephemeral: true });
 
+      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      if (!canManageTicket(cfg, member, ticket))
+        return interaction.reply({ content: '❌ Vous n\'avez pas la permission d\'utiliser cette commande.', ephemeral: true });
+
+      const channelId = interaction.channel.id;
       await interaction.reply({ content: '🗑️ Suppression du ticket...' });
-      setTimeout(() => interaction.channel.delete().catch(() => {}), 1_500);
+      setTimeout(async () => {
+        const freshCfg = loadConfig();
+        if (freshCfg.tickets) {
+          delete freshCfg.tickets[channelId];
+          saveConfig(freshCfg);
+        }
+        await interaction.channel.delete().catch(() => {});
+      }, 1_500);
+    }
+
+    // ── /rename ──────────────────────────────────────────
+    if (commandName === 'rename') {
+      const ticket = getTicket(cfg, interaction.channel);
+      if (!ticket)
+        return interaction.reply({ content: '❌ Utilisable uniquement dans un ticket.', ephemeral: true });
+
+      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      if (!canManageTicket(cfg, member, ticket))
+        return interaction.reply({ content: '❌ Vous n\'avez pas la permission d\'utiliser cette commande.', ephemeral: true });
+
+      const sanitized = sanitizeChannelName(interaction.options.getString('message'));
+      if (!sanitized)
+        return interaction.reply({ content: '❌ Nom invalide (utilise des lettres, chiffres et tirets).', ephemeral: true });
+
+      // On accuse réception tout de suite : renommer un salon est limité par
+      // Discord (rate limit) et peut prendre du temps avant de passer, donc on
+      // ne bloque jamais l'accusé de réception de l'interaction sur cet appel.
+      await interaction.deferReply({ ephemeral: true });
+      try {
+        await interaction.channel.setName(sanitized);
+        return interaction.editReply({ content: `✅ Salon renommé en **${sanitized}**.` });
+      } catch (e) {
+        console.error('[Rename] Erreur :', e);
+        return interaction.editReply({ content: '❌ Impossible de renommer le salon pour le moment (limite Discord probablement atteinte, réessaie dans quelques minutes).' });
+      }
     }
 
     return;
@@ -641,13 +820,14 @@ client.on('interactionCreate', async (interaction) => {
 
     // ── Claim ────────────────────────────────────────────
     if (customId === 'ticket_claim') {
-      const topic = interaction.channel.topic || '';
+      const ticket = getTicket(cfg, interaction.channel);
+      if (!ticket)
+        return interaction.reply({ content: '❌ Ticket introuvable.', ephemeral: true });
 
       // Déjà claim ? → on bloque, il faut passer par Unclaim
-      const claimedMatch = topic.match(/claimed:(\d+)/);
-      if (claimedMatch) {
+      if (ticket.claimedBy) {
         return interaction.reply({
-          content: `❌ Ce ticket est déjà claim par <@${claimedMatch[1]}>. Utilise **Unclaim** pour le libérer.`,
+          content: `❌ Ce ticket est déjà claim par <@${ticket.claimedBy}>. Utilise **Unclaim** pour le libérer.`,
           ephemeral: true
         });
       }
@@ -655,14 +835,13 @@ client.on('interactionCreate', async (interaction) => {
       const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
       if (!member) return interaction.reply({ content: '❌ Erreur membre.', ephemeral: true });
 
-      const btnIdMatch  = topic.match(/btnId:([^|]+)/);
-      const ticketBtnId = btnIdMatch ? btnIdMatch[1] : null;
-      const btnDef      = ticketBtnId ? cfg.buttons.find(b => b.id === ticketBtnId) : null;
-      const pingRoleId  = btnDef?.pingRoleId ?? null;
+      const btnDef     = ticket.btnId ? cfg.buttons.find(b => b.id === ticket.btnId) : null;
+      const pingRoleId = btnDef?.pingRoleId ?? null;
 
       const canAct =
-        (pingRoleId           && member.roles.cache.has(pingRoleId))       ||
+        (pingRoleId           && member.roles.cache.has(pingRoleId))         ||
         (cfg.superiorRoleId   && member.roles.cache.has(cfg.superiorRoleId)) ||
+        (Array.isArray(cfg.manageRoles) && cfg.manageRoles.some(r => member.roles.cache.has(r))) ||
         isOwner(interaction.user.id);
 
       if (!canAct)
@@ -671,9 +850,11 @@ client.on('interactionCreate', async (interaction) => {
           ephemeral: true
         });
 
-      await interaction.channel.setTopic(
-        topic.replace(/\|?claimed:\d+/g, '').trim() + `|claimed:${interaction.user.id}`
-      ).catch(() => {});
+      // On met à jour uniquement le registre interne (config.json), plus le
+      // topic du salon : c'est ce qui causait l'échec d'interaction au
+      // re-claim (Discord limite les modifs de salon à 2 / 10 min).
+      ticket.claimedBy = interaction.user.id;
+      saveConfig(cfg);
 
       // On édite l'embed existant pour ajouter "Claimed by"
       const embed = EmbedBuilder.from(interaction.message.embeds[0])
@@ -687,13 +868,14 @@ client.on('interactionCreate', async (interaction) => {
 
     // ── Unclaim ──────────────────────────────────────────
     if (customId === 'ticket_unclaim') {
-      const topic = interaction.channel.topic || '';
-      const claimedMatch = topic.match(/claimed:(\d+)/);
+      const ticket = getTicket(cfg, interaction.channel);
+      if (!ticket)
+        return interaction.reply({ content: '❌ Ticket introuvable.', ephemeral: true });
 
-      if (!claimedMatch)
+      if (!ticket.claimedBy)
         return interaction.reply({ content: '❌ Ce ticket n\'est pas claim.', ephemeral: true });
 
-      const claimedBy = claimedMatch[1];
+      const claimedBy = ticket.claimedBy;
 
       const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
       if (!member) return interaction.reply({ content: '❌ Erreur membre.', ephemeral: true });
@@ -701,7 +883,8 @@ client.on('interactionCreate', async (interaction) => {
       const canManage =
         claimedBy === interaction.user.id ||
         isOwner(interaction.user.id) ||
-        (cfg.superiorRoleId && member.roles.cache.has(cfg.superiorRoleId));
+        (cfg.superiorRoleId && member.roles.cache.has(cfg.superiorRoleId)) ||
+        (Array.isArray(cfg.manageRoles) && cfg.manageRoles.some(r => member.roles.cache.has(r)));
 
       if (!canManage)
         return interaction.reply({
@@ -709,9 +892,8 @@ client.on('interactionCreate', async (interaction) => {
           ephemeral: true
         });
 
-      await interaction.channel.setTopic(
-        topic.replace(/\|?claimed:\d+/g, '').trim()
-      ).catch(() => {});
+      ticket.claimedBy = null;
+      saveConfig(cfg);
 
       // On édite l'embed existant pour retirer "Claimed by"
       const embed = EmbedBuilder.from(interaction.message.embeds[0]);
@@ -775,8 +957,8 @@ client.on('interactionCreate', async (interaction) => {
       name:               `gs-${ticketNum}`,
       type:               ChannelType.GuildText,
       permissionOverwrites: overwrites,
-      // Le topic stocke le btnId et le créateur pour claim/unclaim
-      topic: `btnId:${buttonId}|creator:${interaction.user.id}`
+      // Topic informatif uniquement (jamais réédité ensuite, donc pas de rate-limit)
+      topic: `Ticket ouvert par ${interaction.user.tag}`
     };
     if (categoryId) channelOpts.parent = categoryId;
 
@@ -787,6 +969,15 @@ client.on('interactionCreate', async (interaction) => {
       console.error('[Ticket] Création échouée :', e);
       return interaction.editReply({ content: '❌ Impossible de créer le ticket. Vérifie les permissions du bot et que la catégorie configurée existe bien.' });
     }
+
+    // Enregistrement du ticket dans le registre interne (claim/unclaim, permissions...)
+    if (!cfg.tickets) cfg.tickets = {};
+    cfg.tickets[ticketChannel.id] = {
+      btnId:     buttonId,
+      creatorId: interaction.user.id,
+      claimedBy: null
+    };
+    saveConfig(cfg);
 
     // ── Embed du ticket — texte dynamique basé sur le rôle pingé ──
     const ticketEmbed = new EmbedBuilder()
